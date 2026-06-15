@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -134,6 +135,87 @@ func getDirSize(dirPath string) (int64, error) {
 	return size, err
 }
 
+func getServerStats() (string, string, float64) {
+	// Attempt to read system-wide memory from Linux /proc/meminfo
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		var total, avail, free, buff, cache float64
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fmt.Sscanf(line, "MemTotal: %f kB", &total)
+			} else if strings.HasPrefix(line, "MemAvailable:") {
+				fmt.Sscanf(line, "MemAvailable: %f kB", &avail)
+			} else if strings.HasPrefix(line, "MemFree:") {
+				fmt.Sscanf(line, "MemFree: %f kB", &free)
+			} else if strings.HasPrefix(line, "Buffers:") {
+				fmt.Sscanf(line, "Buffers: %f kB", &buff)
+			} else if strings.HasPrefix(line, "Cached:") {
+				fmt.Sscanf(line, "Cached: %f kB", &cache)
+			}
+		}
+
+		if total > 0 {
+			// Fallback calculation for older kernels lacking MemAvailable
+			if avail == 0 {
+				avail = free + buff + cache
+			}
+			used := total - avail
+			percent := (used / total) * 100
+
+			formatKB := func(kb float64) string {
+				if kb >= 1024*1024 {
+					return fmt.Sprintf("%.1f GB", kb/(1024*1024))
+				}
+				return fmt.Sprintf("%.0f MB", kb/1024)
+			}
+			return formatKB(used), formatKB(total), percent
+		}
+	}
+
+	// Fallback: Go runtime memory (process only) for non-Linux or error cases
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	usedMB := float64(m.Alloc) / 1024 / 1024
+	totalMB := float64(m.Sys) / 1024 / 1024
+	percent := 0.0
+	if totalMB > 0 {
+		percent = (usedMB / totalMB) * 100
+	}
+	return fmt.Sprintf("%.1f MB", usedMB), fmt.Sprintf("%.1f MB", totalMB), percent
+}
+
+func getTemplateFuncMap() template.FuncMap {
+	return template.FuncMap{
+		"formatSize": func(bytes int64) string {
+			const (
+				kb = 1024
+				mb = kb * 1024
+				gb = mb * 1024
+			)
+			switch {
+			case bytes < kb:
+				return fmt.Sprintf("%d B", bytes)
+			case bytes < mb:
+				return fmt.Sprintf("%.2f KB", float64(bytes)/kb)
+			case bytes < gb:
+				return fmt.Sprintf("%.2f MB", float64(bytes)/mb)
+			default:
+				return fmt.Sprintf("%.2f GB", float64(bytes)/gb)
+			}
+		},
+		"isImage": func(filename string) bool {
+			ext := strings.ToLower(filepath.Ext(filename))
+			return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".bmp" || ext == ".webp"
+		},
+		"usagePercent": func(used, max int64) float64 {
+			if max == 0 {
+				return 0
+			}
+			return (float64(used) / float64(max)) * 100
+		},
+	}
+}
+
 func serveDirectoryListing(w http.ResponseWriter, r *http.Request, fullPath, currentPath string) {
 	files, err := os.ReadDir(fullPath)
 	if err != nil {
@@ -169,51 +251,23 @@ func serveDirectoryListing(w http.ResponseWriter, r *http.Request, fullPath, cur
 		}
 	}
 	usedStorage, _ := getDirSize(storageDir)
-	funcMap := template.FuncMap{
-		"formatSize": func(bytes int64) string {
-			const (
-				kb = 1024
-				mb = kb * 1024
-				gb = mb * 1024
-			)
-			switch {
-			case bytes < kb:
-				return fmt.Sprintf("%d B", bytes)
-			case bytes < mb:
-				return fmt.Sprintf("%.2f KB", float64(bytes)/kb)
-			case bytes < gb:
-				return fmt.Sprintf("%.2f MB", float64(bytes)/mb)
-			default:
-				return fmt.Sprintf("%.2f GB", float64(bytes)/gb)
-			}
-		},
-		"isImage": func(filename string) bool {
-			ext := strings.ToLower(filepath.Ext(filename))
-			return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".bmp" || ext == ".webp"
-		},
-		"usagePercent": func(used, max int64) float64 {
-			if max == 0 {
-				return 0
-			}
-			p := (float64(used) / float64(max)) * 100
-			if p > 100 {
-				return 100
-			}
-			return p
-		},
-	}
-	tmpl, err := template.New("fileList").Funcs(funcMap).Parse(fileListTemplate)
+	tmpl, err := template.New("fileList").Funcs(getTemplateFuncMap()).Parse(fileListTemplate)
 	if err != nil {
 		log.Printf("Error parsing template: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)
 		return
 	}
+	ramUsed, ramTotal, ramPercent := getServerStats()
 	data := TemplateData{
 		CurrentPath: currentPath,
 		ParentPath:  parentPath,
 		Files:       fileInfos,
 		UsedStorage: usedStorage,
 		MaxStorage:  maxStorageSize,
+		RAMUsed:     ramUsed,
+		RAMTotal:    ramTotal,
+		RAMPercent:  ramPercent,
+		CPUUsage:    runtime.NumGoroutine(), // Simple proxy for activity
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tmpl.Execute(w, data); err != nil {
@@ -239,45 +293,53 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(cleanTargetDir, "/") {
 		cleanTargetDir = "/" + cleanTargetDir
 	}
-	err := r.ParseMultipartForm(32 << 20)
+
+	reader, err := r.MultipartReader()
 	if err != nil {
-		log.Printf("Error parsing multipart form: %v", err)
-		http.Error(w, "Error parsing form data", http.StatusInternalServerError)
+		log.Printf("Error creating multipart reader: %v", err)
+		http.Error(w, "Upload failed", http.StatusInternalServerError)
 		return
 	}
-	files := r.MultipartForm.File["uploadFile"]
-	if len(files) == 0 {
-		http.Error(w, "No files uploaded", http.StatusBadRequest)
-		return
-	}
+
 	currentUsed, _ := getDirSize(storageDir)
-	for _, fileHeader := range files {
-		if currentUsed+fileHeader.Size > maxStorageSize {
-			log.Printf("Storage limit exceeded: cannot upload %s (%d bytes)", fileHeader.Filename, fileHeader.Size)
-			continue
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
 		}
-		file, err := fileHeader.Open()
 		if err != nil {
-			log.Printf("Error opening uploaded file %s: %v", fileHeader.Filename, err)
+			log.Printf("Error reading multipart part: %v", err)
+			break
+		}
+
+		filename := part.FileName()
+		if filename == "" || part.FormName() != "uploadFile" {
 			continue
 		}
-		destPath := filepath.Join(storageDir, cleanTargetDir, fileHeader.Filename)
+
+		destPath := filepath.Join(storageDir, cleanTargetDir, filename)
 		dst, err := os.Create(destPath)
 		if err != nil {
 			log.Printf("Error creating destination file %s: %v", destPath, err)
-			file.Close()
 			continue
 		}
-		if _, err := io.Copy(dst, file); err != nil {
-			log.Printf("Error copying file content to %s: %v", destPath, err)
-			dst.Close()
-			file.Close()
-			continue
-		}
-		addRecent(getIP(r), filepath.ToSlash(filepath.Join(cleanTargetDir, fileHeader.Filename)))
-		currentUsed += fileHeader.Size
+
+		written, copyErr := io.Copy(dst, part)
 		dst.Close()
-		file.Close()
+		if copyErr != nil {
+			log.Printf("Error saving file %s: %v", filename, copyErr)
+			os.Remove(destPath)
+			continue
+		}
+
+		currentUsed += written
+		if currentUsed > maxStorageSize {
+			log.Printf("Storage limit exceeded, deleting partial upload: %s", filename)
+			os.Remove(destPath)
+			break
+		}
+
+		addRecent(getIP(r), filepath.ToSlash(filepath.Join(cleanTargetDir, filename)))
 	}
 	http.Redirect(w, r, "/storage"+cleanTargetDir, http.StatusSeeOther)
 }
@@ -429,18 +491,26 @@ func serveVirtualListing(w http.ResponseWriter, r *http.Request, title string, p
 		})
 	}
 	usedStorage, _ := getDirSize(storageDir)
+	ramUsed, ramTotal, ramPercent := getServerStats()
 	data := TemplateData{
 		CurrentPath: title,
 		ParentPath:  "",
 		Files:       fileInfos,
 		UsedStorage: usedStorage,
 		MaxStorage:  maxStorageSize,
+		RAMUsed:     ramUsed,
+		RAMTotal:    ramTotal,
+		RAMPercent:  ramPercent,
+		CPUUsage:    runtime.NumGoroutine(),
 	}
-	tmpl, _ := template.New("fileList").Funcs(template.FuncMap{
-		"formatSize":   func(b int64) string { return fmt.Sprintf("%.2f MB", float64(b)/(1024*1024)) },
-		"isImage":      func(n string) bool { ext := strings.ToLower(filepath.Ext(n)); return ext == ".jpg" || ext == ".png" },
-		"usagePercent": func(u, m int64) float64 { return (float64(u) / float64(m)) * 100 },
-	}).Parse(fileListTemplate)
+	tmpl, err := template.New("fileList").Funcs(getTemplateFuncMap()).Parse(fileListTemplate)
+	if err != nil {
+		log.Printf("Error parsing template: %v", err)
+		http.Error(w, "Error rendering page", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmpl.Execute(w, data)
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Printf("Error executing template: %v", err)
+	}
 }

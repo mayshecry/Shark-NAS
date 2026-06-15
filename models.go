@@ -15,4 +15,8 @@ type TemplateData struct {
 	Files       []FileInfo
 	UsedStorage int64
 	MaxStorage  int64
+	RAMUsed     string
+	RAMTotal    string
+	RAMPercent  float64
+	CPUUsage    int
 }
