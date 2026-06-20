@@ -311,8 +311,6 @@ const fileListTemplate = `
                 for (let i = 0; i < files.length; i++) {
                     formData.append('uploadFile', files[i]);
                 }
-                
-                // Visual feedback during upload
                 workspace.style.opacity = '0.5';
                 workspace.style.pointerEvents = 'none';
 
